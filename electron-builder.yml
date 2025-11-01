@@ -1,0 +1,25 @@
+appId: com.aircargo.analytics
+productName: 航空货运分析软件
+directories:
+  buildResources: build
+files:
+  - dist
+  - dist-electron
+  - node_modules/better-sqlite3
+  - "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}"
+  - "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}"
+  - "!**/node_modules/*.d.ts"
+  - "!**/node_modules/.bin"
+  - "!**/*.{iml,o,hprof,orig,pyc,pyo,rbc,swp,csproj,sln,xproj}"
+win:
+  target: 
+    - target: nsis
+      arch: [x64]
+  sign: false  # 跳过代码签名
+  # icon: build/icon.ico  # 如果图标文件不存在，electron-builder 会跳过此选项
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+# 配置原生模块重建
+nodeGypRebuild: false
+

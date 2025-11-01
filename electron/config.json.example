@@ -1,0 +1,11 @@
+{
+  "ai": {
+    "provider": "deepseek",
+    "apiKey": "sk-your-api-key-here",
+    "baseUrl": "https://api.deepseek.com",
+    "model": "deepseek-chat",
+    "temperature": 0.7,
+    "maxTokens": 2000
+  }
+}
+
