@@ -14,18 +14,11 @@ files:
   - "!**/*.{iml,o,hprof,orig,pyc,pyo,rbc,swp,csproj,sln,xproj}"
 win:
   target: 
-    - target: nsis
+    - target: zip
       arch: [x64]
   signAndEditExecutable: false  # 禁用可执行文件签名编辑
   # icon: build/icon.ico  # 如果图标文件不存在，electron-builder 会跳过此选项
-nsis:
-  oneClick: false
-  allowToChangeInstallationDirectory: true
-  perMachine: false
-  createDesktopShortcut: always
-  createStartMenuShortcut: true
-  # 禁用可能导致问题的选项
-  differentialPackage: false
+  # 使用 ZIP 解压版：用户解压后直接运行，无需安装程序，避免 NSIS 完整性检查问题
 mac:
   target:
     - target: default
