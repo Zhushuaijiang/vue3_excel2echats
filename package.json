@@ -26,7 +26,10 @@
     "cargo",
     "analytics"
   ],
-  "author": "",
+  "author": {
+    "name": "Air Cargo Analytics",
+    "email": "504625088@qq.com"
+  },
   "license": "MIT",
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.1",

@@ -32,6 +32,7 @@ linux:
     - deb
     - rpm
   category: Office
+  maintainer: 504625088@qq.com
 # 配置原生模块重建
 nodeGypRebuild: false
 
