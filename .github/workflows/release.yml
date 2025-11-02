@@ -43,13 +43,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 打包应用 (macOS)
-        if: matrix.os == 'macos-latest'
-        run: npx electron-builder --mac --x64 --publish never
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CSC_IDENTITY_AUTO_DISCOVERY: false  # 跳过代码签名（如果需要签名，需要配置证书）
-
       - name: 打包应用 (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: npx electron-builder --linux --x64 --publish never
