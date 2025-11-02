@@ -24,8 +24,6 @@ nsis:
   perMachine: false
   createDesktopShortcut: always
   createStartMenuShortcut: true
-  # 优化压缩设置，避免完整性检查失败
-  compression: normal
   # 禁用可能导致问题的选项
   differentialPackage: false
 mac:
