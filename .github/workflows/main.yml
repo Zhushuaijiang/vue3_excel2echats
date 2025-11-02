@@ -65,38 +65,39 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 下载所有构建产物
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: 准备 Release 文件
-        shell: bash
-        run: |
-          # 创建 releases 目录
-          mkdir -p releases
-          # 复制所有构建产物到 releases 目录
-          find artifacts -type f \( -name "*.exe" -o -name "*.dmg" -o -name "*.zip" -o -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" -o -name "*.tar.gz" \) -exec cp {} releases/ \;
-          # 列出文件以确认
-          ls -lh releases/
-          echo "找到 $(ls releases/ | wc -l) 个文件"
-
-      - name: 创建 Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: releases/*
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # Release 步骤已禁用 - 构建产物会保存在 artifacts 中，可手动创建 Release
+  # release:
+  #   needs: build
+  #   runs-on: ubuntu-latest
+  #   if: startsWith(github.ref, 'refs/tags/v')
+  #   
+  #   steps:
+  #     - name: 检出代码
+  #       uses: actions/checkout@v4
+  #
+  #     - name: 下载所有构建产物
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         path: artifacts
+  #
+  #     - name: 准备 Release 文件
+  #       shell: bash
+  #       run: |
+  #         # 创建 releases 目录
+  #         mkdir -p releases
+  #         # 复制所有构建产物到 releases 目录
+  #         find artifacts -type f \( -name "*.exe" -o -name "*.dmg" -o -name "*.zip" -o -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" -o -name "*.tar.gz" \) -exec cp {} releases/ \;
+  #         # 列出文件以确认
+  #         ls -lh releases/
+  #         echo "找到 $(ls releases/ | wc -l) 个文件"
+  #
+  #     - name: 创建 Release
+  #       uses: softprops/action-gh-release@v1
+  #       with:
+  #         files: releases/*
+  #         draft: false
+  #         prerelease: false
+  #         generate_release_notes: true
+  #       env:
+  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
