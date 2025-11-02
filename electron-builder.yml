@@ -1,5 +1,6 @@
 appId: com.aircargo.analytics
 productName: 航空货运分析软件
+electronVersion: 28.3.3  # 明确指定 Electron 版本
 directories:
   buildResources: build
 files:
@@ -15,7 +16,7 @@ win:
   target: 
     - target: nsis
       arch: [x64]
-  sign: false  # 跳过代码签名
+  signAndEditExecutable: false  # 禁用可执行文件签名编辑
   # icon: build/icon.ico  # 如果图标文件不存在，electron-builder 会跳过此选项
 nsis:
   oneClick: false
