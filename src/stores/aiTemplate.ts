@@ -13,17 +13,17 @@ export const useAITemplateStore = defineStore('aiTemplate', {
       return result || []
     },
     
-    async createTemplate(data: { name: string; prompt: string }) {
+    async createTemplate(data: { name: string; prompt: string; config_id?: number | null }) {
       await window.electronAPI.dbExecute(
-        'INSERT INTO ai_templates (name, prompt) VALUES (?, ?)',
-        [data.name, data.prompt]
+        'INSERT INTO ai_templates (name, prompt, config_id) VALUES (?, ?, ?)',
+        [data.name, data.prompt, data.config_id || null]
       )
     },
     
-    async updateTemplate(id: number, data: { name: string; prompt: string }) {
+    async updateTemplate(id: number, data: { name: string; prompt: string; config_id?: number | null }) {
       await window.electronAPI.dbExecute(
-        'UPDATE ai_templates SET name = ?, prompt = ? WHERE id = ?',
-        [data.name, data.prompt, id]
+        'UPDATE ai_templates SET name = ?, prompt = ?, config_id = ? WHERE id = ?',
+        [data.name, data.prompt, data.config_id || null, id]
       )
     },
     

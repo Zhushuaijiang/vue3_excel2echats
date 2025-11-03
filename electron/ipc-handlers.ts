@@ -203,9 +203,23 @@ export function initDatabase() {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         prompt TEXT NOT NULL,
+        config_id INTEGER,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
+      
     `)
+    
+    // 尝试为已存在的表添加config_id字段（如果不存在）
+    try {
+      const tableInfo = db.prepare("PRAGMA table_info(ai_templates)").all() as any[]
+      const hasConfigId = tableInfo.some((col: any) => col.name === 'config_id')
+      if (!hasConfigId) {
+        db.exec('ALTER TABLE ai_templates ADD COLUMN config_id INTEGER')
+        console.log('已为ai_templates表添加config_id字段')
+      }
+    } catch (e) {
+      // 忽略错误（字段可能已存在）
+    }
     console.log('数据库表创建成功')
     
     // 初始化示例AI模板
@@ -1011,17 +1025,180 @@ export function registerIpcHandlers() {
 
   ipcMain.handle('ai-generate-dashboard', async (_event, options: any) => {
     try {
-      const { prompt, count } = options
+      const { prompt, count, configId } = options
       console.log('开始AI生成大屏，提示词:', prompt)
+
+      // 根据 configId 生成字段与数据概览，注入到提示词，降低幻觉
+      let enrichedPrompt = prompt
+      if (configId && db) {
+        try {
+          const cfg = db.prepare('SELECT name, fields FROM form_configs WHERE id = ?').get(configId) as any
+          let fields: any[] = []
+          try { fields = cfg?.fields ? JSON.parse(cfg.fields) : [] } catch { fields = [] }
+          const rows = db.prepare('SELECT data FROM cargo_records WHERE config_id = ? ORDER BY created_at DESC LIMIT 200').all(configId) as any[]
+          const parsed = rows.map(r => { try { return JSON.parse(r.data) } catch { return null } }).filter(Boolean)
+          const lines: string[] = []
+          lines.push(`表单名称: ${cfg?.name || ''}`)
+          lines.push(`可用字段(${fields.length}): ${fields.map((f: any) => `${f.name}(${f.type})`).join(', ')}`)
+          // 构造简要的数据分布
+          const pickSamples = (name: string, type: string) => {
+            const vals: any[] = []
+            parsed.forEach((rec: any) => {
+              if (rec.hasOwnProperty(name)) vals.push(rec[name])
+            })
+            if (type === 'number') {
+              const nums = vals.map(v => Number(v)).filter(v => !Number.isNaN(v))
+              const count = nums.length
+              const min = count ? Math.min(...nums) : null
+              const max = count ? Math.max(...nums) : null
+              const avg = count ? Number((nums.reduce((a, b) => a + b, 0) / count).toFixed(2)) : null
+              return `数值: 样本=${count}, 范围=[${min}~${max}], 均值=${avg}`
+            } else {
+              const uniq = Array.from(new Set(vals.filter(v => v !== undefined && v !== null))).slice(0, 6)
+              return `示例: ${uniq.join('，')}`
+            }
+          }
+          const sampleLines: string[] = []
+          fields.slice(0, 8).forEach((f: any) => {
+            sampleLines.push(`- ${f.name}(${f.type}): ${pickSamples(f.name, f.type)}`)
+          })
+          const guardrails = [
+            '严格使用上面列出的字段名称进行描述，不得杜撰不存在的字段或维度。',
+            "若无法确定字段含义，请保守描述并优先选择通用图表类型('line'|'bar'|'pie')。",
+            '仅输出布局相关属性（id,type,title,x,y,w,h），不在此处输出 ECharts option。'
+          ]
+          enrichedPrompt = `${prompt}\n\n[表单上下文]\n${lines.join('\n')}\n字段数据样例:\n${sampleLines.join('\n')}\n\n[约束]\n${guardrails.join('\n')}`
+        } catch (e) {
+          // 如果上下文构建失败，继续使用原始提示词
+        }
+      }
       
-      const result = await generateDashboardWidgets(prompt, count || 3)
+      const result = await generateDashboardWidgets(enrichedPrompt, count || 3)
       
       // 为每个widget生成option配置
       if (result.widgets) {
-        result.widgets = result.widgets.map((widget: any) => {
-          widget.option = generateWidgetOption(widget.type)
-          return widget
-        })
+        // 优先：AI 生成 SQL → 执行结果绘图；失败则回退到本地聚合
+        const records = await (async () => {
+          if (!db) initDatabase()
+          if (!db) return []
+          let sql = 'SELECT data, created_at FROM cargo_records'
+          const params: any[] = []
+          if (configId) {
+            sql = 'SELECT data, created_at FROM cargo_records WHERE config_id = ?'
+            params.push(configId)
+          }
+          sql += ' ORDER BY created_at DESC LIMIT 500'
+          const rows = db.prepare(sql).all(params) as any[]
+          return rows.map(r => ({ created_at: r.created_at, data: safeJsonParse(r.data) }))
+        })()
+
+        // 准备模式与样本键
+        const schemaSummary = getDbSchemaSummary()
+        const sampleKeys = getSampleJsonKeys(records)
+        // 获取所有可能的字段名（包括当前configId的所有字段，如果有的话）
+        let allPossibleKeys = [...sampleKeys]
+        if (configId && db) {
+          try {
+            const cfg = db.prepare('SELECT fields FROM form_configs WHERE id = ?').get(configId) as any
+            if (cfg?.fields) {
+              const fields = JSON.parse(cfg.fields)
+              const fieldNames = fields.map((f: any) => f.name)
+              allPossibleKeys = Array.from(new Set([...allPossibleKeys, ...fieldNames]))
+            }
+          } catch (e) {
+            // 忽略错误
+          }
+        }
+
+        for (const widget of result.widgets) {
+          // 在外部作用域声明SQL变量，以便catch块可以访问
+          let originalSql = ''
+          let enforcedSql = ''
+          
+          try {
+            const sqlPlan = await aiGenerateSQLForWidget(widget.type, enrichedPrompt, schemaSummary, sampleKeys, configId)
+            originalSql = (sqlPlan.sql || '').trim()
+            // 如果AI未返回SQL，则基于样本字段构造一个安全的默认SQL
+            if (!originalSql) {
+              originalSql = buildDefaultSQL(widget.type, sampleKeys)
+            }
+            // 修复SQL：确保所有字段访问都使用json_extract，而不是直接列名（使用所有可能的字段名）
+            originalSql = fixJsonExtractInSQL(originalSql, allPossibleKeys)
+            enforcedSql = enforceConfigIdInSql(originalSql, configId)
+            widget.sql = enforcedSql // 保存最终执行的SQL
+            
+            // 验证SQL可执行性
+            let sqlValidation: any = { valid: false, error: null, rowCount: 0 }
+            let finalSql = enforcedSql // 最终执行的SQL
+            
+            try {
+              const testRows = executeChartSQL(finalSql)
+              sqlValidation = { valid: true, error: null, rowCount: testRows?.length || 0 }
+              widget.option = buildOptionFromSqlRows(widget.type, testRows)
+            } catch (sqlError: any) {
+              const errorMsg = sqlError.message || 'SQL执行失败'
+              
+              // 如果是列名错误，尝试修复并重试
+              if (errorMsg.includes('no such column') || errorMsg.includes('no such table column')) {
+                try {
+                  // 从错误信息中提取字段名
+                  const columnMatch = errorMsg.match(/no such column:\s*([^\s,]+)/i)
+                  const errorColumn = columnMatch ? columnMatch[1] : null
+                  
+                  // 如果找到了错误字段名，添加到修复列表
+                  let keysForFix = [...allPossibleKeys]
+                  if (errorColumn && !keysForFix.includes(errorColumn)) {
+                    keysForFix.push(errorColumn)
+                  }
+                  
+                  // 再次修复SQL（可能字段名转义有问题）
+                  const retrySql = fixJsonExtractInSQL(finalSql, keysForFix)
+                  if (retrySql !== finalSql) {
+                    const retryRows = executeChartSQL(retrySql)
+                    sqlValidation = { valid: true, error: null, rowCount: retryRows?.length || 0 }
+                    widget.option = buildOptionFromSqlRows(widget.type, retryRows)
+                    finalSql = retrySql // 更新为修复后的SQL
+                    widget.sql = finalSql
+                  } else {
+                    sqlValidation = { valid: false, error: errorMsg, rowCount: 0 }
+                    throw sqlError
+                  }
+                } catch (retryError: any) {
+                  sqlValidation = { valid: false, error: `修复后仍失败: ${retryError.message}`, rowCount: 0 }
+                  throw sqlError
+                }
+              } else {
+                sqlValidation = { valid: false, error: errorMsg, rowCount: 0 }
+                throw sqlError
+              }
+            }
+            
+            // 保存调试信息
+            const isDefaultSql = !sqlPlan.sql || !sqlPlan.sql.trim()
+            widget.debug = {
+              prompt: sqlPlan.prompt || enrichedPrompt || '（提示词生成失败）',
+              originalSql: originalSql || '（无SQL）',
+              enforcedSql: finalSql || '（无SQL）',
+              sqlValidation: sqlValidation,
+              configId: configId || null,
+              isDefaultSql: isDefaultSql // 标记是否为默认生成的SQL
+            }
+          } catch (e) {
+            // 即使失败，也保存已生成的SQL用于调试
+            const errorMsg = (e as Error).message || '生成失败'
+            widget.sql = null // 回退时标记无SQL
+            widget.debug = {
+              prompt: enrichedPrompt || '（SQL生成失败，使用默认数据聚合）',
+              originalSql: originalSql || '（SQL生成失败）',
+              enforcedSql: enforcedSql || widget.sql || '（SQL执行失败）',
+              sqlValidation: { valid: false, error: errorMsg, rowCount: 0 },
+              configId: configId || null,
+              isDefaultSql: !originalSql || originalSql.includes('json_extract')
+            }
+            const fallback = buildOptionFromRecords(widget.type, records)
+            widget.option = fallback
+          }
+        }
       }
       
       return {
@@ -1103,5 +1280,364 @@ function generateWidgetOption(type: string) {
         ]
       }]
     }
+  }
+}
+
+function safeJsonParse(str: string) {
+  try { return JSON.parse(str) } catch { return {} }
+}
+
+function buildOptionFromRecords(type: string, records: { created_at: string; data: any }[]) {
+  const baseOption: any = {
+    title: { text: '数据展示', left: 'center', textStyle: { color: '#fff' } },
+    tooltip: { trigger: 'axis' },
+    grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
+    textStyle: { color: '#fff' }
+  }
+
+  if (!records || records.length === 0) {
+    return generateWidgetOption(type)
+  }
+
+  if (type === 'line') {
+    const daysMap: Record<string, number> = {}
+    const now = new Date()
+    const since = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)
+    for (const r of records) {
+      const dt = new Date(r.created_at)
+      if (dt < since) continue
+      const day = (r.created_at || '').toString().split('T')[0]
+      const val = pickNumber(r.data, ['货物重量(kg)', '提货重量(kg)', '转运货物量(kg)', '配送重量(kg)', '入库数量', '重量', '数量']) || 0
+      daysMap[day] = (daysMap[day] || 0) + (Number(val) || 0)
+    }
+    const days = Object.keys(daysMap).sort().slice(-15)
+    return {
+      ...baseOption,
+      xAxis: { type: 'category', data: days.map(d => d.substring(5)), axisLabel: { color: '#fff' }, axisLine: { lineStyle: { color: '#fff' } } },
+      yAxis: { type: 'value', axisLabel: { color: '#fff' }, axisLine: { lineStyle: { color: '#fff' } } },
+      series: [{ type: 'line', data: days.map(d => Math.round(daysMap[d] || 0)), smooth: true, lineStyle: { color: '#409eff' }, areaStyle: { color: 'rgba(64, 158, 255, 0.2)' } }]
+    }
+  }
+
+  if (type === 'bar') {
+    const catMap: Record<string, number> = {}
+    for (const r of records) {
+      const cat = pickValue(r.data, ['出发城市', '出发机场', '目的城市', '目的地机场', '航线', '货物名称', '货物类型', '仓库编号']) || '未知'
+      const val = pickNumber(r.data, ['货物重量(kg)', '提货重量(kg)', '转运货物量(kg)', '配送重量(kg)', '入库数量', '重量', '数量']) || 1
+      catMap[cat] = (catMap[cat] || 0) + Number(val)
+    }
+    const top = Object.entries(catMap).sort((a, b) => (b[1] as number) - (a[1] as number)).slice(0, 6)
+    return {
+      ...baseOption,
+      xAxis: { type: 'category', data: top.map(i => i[0]), axisLabel: { color: '#fff', rotate: -45, interval: 0 }, axisLine: { lineStyle: { color: '#fff' } } },
+      yAxis: { type: 'value', axisLabel: { color: '#fff' }, axisLine: { lineStyle: { color: '#fff' } } },
+      series: [{ type: 'bar', data: top.map(i => Math.round(Number(i[1]))), itemStyle: { color: '#67c23a' } }]
+    }
+  }
+
+  // pie
+  const dist: Record<string, number> = {}
+  for (const r of records) {
+    const cat = pickValue(r.data, ['货物类型', '货物名称', '货物状态', '仓库编号', '仓库管理员', '航线']) || '其他'
+    const val = pickNumber(r.data, ['货物重量(kg)', '提货重量(kg)', '转运货物量(kg)', '配送重量(kg)', '入库数量', '重量', '数量']) || 1
+    dist[cat] = (dist[cat] || 0) + Number(val)
+  }
+  const pieData = Object.entries(dist).sort((a, b) => (b[1] as number) - (a[1] as number)).slice(0, 5).map(i => ({ name: i[0], value: Math.round(Number(i[1])) }))
+  return {
+    ...baseOption,
+    series: [{ type: 'pie', radius: '60%', data: pieData, label: { color: '#fff' } }]
+  }
+}
+
+function pickNumber(data: any, keys: string[]) {
+  for (const k of keys) {
+    if (data && data[k] !== undefined && data[k] !== null && data[k] !== '') {
+      const n = Number(data[k])
+      if (!Number.isNaN(n)) return n
+    }
+  }
+  return null
+}
+
+function pickValue(data: any, keys: string[]) {
+  for (const k of keys) {
+    if (data && data[k] !== undefined && data[k] !== null && data[k] !== '') {
+      return data[k]
+    }
+  }
+  return null
+}
+
+// ==== 新增：SQL 驱动的图表生成 ====
+function getDbSchemaSummary() {
+  // 由于结构固定，这里直接提供简要模式说明
+  return `Tables:
+  form_configs(id INTEGER PRIMARY KEY, name TEXT, fields TEXT(JSON), created_at DATETIME)
+  cargo_records(id INTEGER PRIMARY KEY, config_id INTEGER, data TEXT(JSON), created_at DATETIME)
+Notes:
+  - cargo_records.data 为 JSON 文本，字段名为中文，如 "货物重量(kg)", "出发城市", "发货日期" 等。
+  - 在 SQLite 中用 json_extract(data, '$."字段名"') 读取。
+  - 常用数值字段：货物重量(kg)、运费(元)、提货重量(kg)、转运货物量(kg)、入库数量。
+  - 常用日期字段：发货日期、起飞时间、转入日期、转出日期、配送日期、created_at。
+  - 常用分类字段：出发城市、目的城市、出发机场、目的地机场、货物类型、运输状态、仓库编号。
+`}
+
+function getSampleJsonKeys(records: { created_at: string; data: any }[], limit: number = 200) {
+  const freq: Record<string, number> = {}
+  const sample = records.slice(0, limit)
+  for (const r of sample) {
+    const d = r.data || {}
+    for (const k of Object.keys(d)) {
+      freq[k] = (freq[k] || 0) + 1
+    }
+  }
+  return Object.entries(freq)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 30)
+    .map(([k]) => k)
+}
+
+async function aiGenerateSQLForWidget(type: string, userPrompt: string, schema: string, keys: string[], configId?: number) {
+  const guide = `你是数据分析工程师。根据给定的数据库模式与样本字段，为指定图表类型生成一个SQLite查询（仅SELECT）。
+要求：
+1) 只返回JSON：{"sql":"..."}
+2) sql 必须是单条 SELECT 语句，不得包含写操作/PRAGMA/多语句
+3) 如需读取 JSON 字段，使用 json_extract(data, '$."字段名"') 并起别名，如 AS category 或 AS value
+4) 如果提供了 configId=${configId ?? '无'}，请在 WHERE 中过滤 cargo_records.config_id=${configId ?? '全部'}
+5) 返回列：折线/柱状 → 第一列为横轴字段(时间或分类)，第二列为数值；饼图 → 第一列为分类，第二列为数值
+`;
+  const prompt = `${guide}
+【数据库模式】\n${schema}\n
+【样本字段】${keys.join(', ')}\n
+【图表类型】${type}\n【用户需求】${userPrompt || '无'}\n`
+
+  const resp = await callDeepSeekAPI(prompt, { count: 1 })
+  // 期望 resp 形如 { sql: "SELECT ..." }
+  let sql = ''
+  if (!resp || typeof resp !== 'object' || !resp.sql) {
+    const sqlText = (typeof resp === 'string') ? resp : ''
+    const extracted = (sqlText.match(/SELECT[\s\S]*$/i) || [])[0] || ''
+    sql = extracted.trim()
+  } else {
+    sql = String(resp.sql).trim()
+  }
+  // 确保 prompt 始终有效
+  const finalPrompt = prompt || '（提示词生成失败，但AI已返回SQL）'
+  return { sql, prompt: finalPrompt }
+}
+
+function fixJsonExtractInSQL(sql: string, jsonKeys: string[]): string {
+  if (!sql || !jsonKeys || jsonKeys.length === 0) return sql
+  
+  // 合法的数据库列名（实际存在的列）
+  const validDbColumns = ['id', 'config_id', 'data', 'created_at', 'x', 'y', 'category', 'value', 'name']
+  
+  let fixed = sql
+  
+  // 对每个JSON字段名，检查是否被直接使用（作为列名而不是json_extract）
+  for (const key of jsonKeys) {
+    // 如果SQL中已经包含该字段的json_extract，跳过
+    const jsonExtractPatterns = [
+      `json_extract(data, '$."${key}"')`,
+      `json_extract(data, '$."${key.replace(/"/g, '\\"')}"')`,
+      `json_extract(data, '$."${key.replace(/\(/g, '\\(').replace(/\)/g, '\\)')}"')`,
+      `json_extract(data, '$."${key.replace(/\(/g, '\\u0028').replace(/\)/g, '\\u0029')}"')`
+    ]
+    if (jsonExtractPatterns.some(pattern => fixed.includes(pattern))) {
+      continue
+    }
+    
+    // 检查字段名是否在SQL中被直接使用（作为列名）
+    // 转义特殊字符用于正则
+    const escapedKey = key.replace(/[.*+?^${}|[\]\\()（）]/g, '\\$&')
+    // 如果字段名包含括号或中文，使用更灵活的匹配
+    const hasSpecialChars = /[()（）]/.test(key)
+    const pattern = hasSpecialChars 
+      ? new RegExp(escapedKey, 'gi')
+      : new RegExp(`\\b${escapedKey}\\b`, 'gi')
+    
+    fixed = fixed.replace(pattern, (match, offset, string) => {
+      // 检查是否在json_extract调用中
+      const contextBefore = string.substring(Math.max(0, offset - 150), offset)
+      const contextAfter = string.substring(offset, Math.min(string.length, offset + 50))
+      if (contextBefore.includes('json_extract') || contextAfter.includes('json_extract')) {
+        return match // 已在json_extract中，不替换
+      }
+      
+      // 检查是否在引号内
+      const before = string.substring(0, offset)
+      const singleQuotes = (before.match(/'/g) || []).length
+      const doubleQuotes = (before.match(/"/g) || []).length
+      if (singleQuotes % 2 !== 0 || doubleQuotes % 2 !== 0) {
+        return match // 在引号内，不替换
+      }
+      
+      // 检查是否是合法的数据库列名
+      if (validDbColumns.includes(match.toLowerCase())) {
+        return match // 是合法的列名，不替换
+      }
+      
+      // 检查是否在AS别名之后
+      const beforeContext = string.substring(Math.max(0, offset - 30), offset).toUpperCase()
+      if (beforeContext.includes(' AS ') || beforeContext.endsWith(' AS')) {
+        return match // 可能是别名，不替换
+      }
+      
+      // 检查是否在FROM/JOIN后面（可能是表名）
+      const beforeContext2 = string.substring(Math.max(0, offset - 50), offset).toUpperCase()
+      if (beforeContext2.includes('FROM') || beforeContext2.includes('JOIN')) {
+        return match // 可能是表名，不替换
+      }
+      
+      // 替换为json_extract（确保字段名中的引号被转义）
+      const safeKey = key.replace(/"/g, '\\"')
+      return `json_extract(data, '$."${safeKey}")`
+    })
+  }
+  
+  return fixed
+}
+
+function buildDefaultSQL(type: string, keys: string[]) {
+  // 选取候选字段
+  const pick = (names: string[]) => names.find(n => keys.includes(n))
+  const num = pick(['货物重量(kg)', '提货重量(kg)', '转运货物量(kg)', '入库数量']) || keys[0] || '货物重量(kg)'
+  const date = pick(['起飞时间', '发货日期', '转入日期', '转出日期', '配送日期', 'created_at']) || 'created_at'
+  const cat = pick(['出发机场', '目的地机场', '出发城市', '目的城市', '货物类型', '承运航空公司']) || keys[0] || '出发机场'
+  
+  // 不在这里添加WHERE，让enforceConfigIdInSql统一处理
+  if (type === 'line') {
+    return `SELECT COALESCE(json_extract(data, '$."${date}"'), substr(created_at,1,10)) AS x, 
+COALESCE(CAST(json_extract(data, '$."${num}"') AS REAL), 0) AS y 
+FROM cargo_records ORDER BY created_at ASC`;
+  } else if (type === 'bar') {
+    return `SELECT COALESCE(json_extract(data, '$."${cat}"'), '其他') AS x, 
+SUM(COALESCE(CAST(json_extract(data, '$."${num}"') AS REAL), 0)) AS y 
+FROM cargo_records GROUP BY x ORDER BY y DESC LIMIT 10`;
+  }
+  return `SELECT COALESCE(json_extract(data, '$."${cat}"'), '其他') AS x, 
+SUM(COALESCE(CAST(json_extract(data, '$."${num}"') AS REAL), 0)) AS y 
+FROM cargo_records GROUP BY x ORDER BY y DESC LIMIT 6`;
+}
+
+function executeChartSQL(sql: string) {
+  if (!db) throw new Error('数据库未初始化')
+  const sanitized = sql.trim()
+  if (!/^select\s+/i.test(sanitized)) throw new Error('仅允许SELECT')
+  if (/[;]{2,}/.test(sanitized) || /\b(drop|delete|update|insert|pragma|alter|attach|reindex|vacuum)\b/i.test(sanitized)) {
+    throw new Error('SQL不被允许')
+  }
+  
+  // 检查是否已有LIMIT子句，避免重复添加
+  let limited: string
+  const hasLimit = /\blimit\s+\d+/i.test(sanitized)
+  
+  if (hasLimit) {
+    // 移除所有现有的LIMIT子句，然后在末尾追加LIMIT 1000
+    const withoutLimit = sanitized.replace(/\s*\blimit\s+\d+/gi, '').trim()
+    limited = `${withoutLimit} LIMIT 1000`
+  } else {
+    // 如果没有LIMIT，追加LIMIT 1000
+    limited = `${sanitized} LIMIT 1000`
+  }
+  
+  const rows = db.prepare(limited).all() as any[]
+  return rows
+}
+
+function enforceConfigIdInSql(sql: string, configId?: number) {
+  if (!configId || !sql || !sql.trim()) return sql
+  let s = sql.trim()
+  const id = Number(configId)
+  
+  // 如果语句中没有针对 cargo_records 的 FROM，直接返回原SQL，避免拼接非法 WHERE
+  if (!/from\s+cargo_records\b/i.test(s)) {
+    console.warn('SQL中未找到cargo_records表，跳过config_id过滤:', s.substring(0, 100))
+    return s
+  }
+  
+  // 尝试识别 cargo_records 的别名
+  const fromMatch = s.match(/from\s+cargo_records\s+(?:as\s+)?([a-zA-Z_][\w]*)/i)
+  const joinMatch = s.match(/join\s+cargo_records\s+(?:as\s+)?([a-zA-Z_][\w]*)/i)
+  const alias = (fromMatch && fromMatch[1]) || (joinMatch && joinMatch[1]) || 'cargo_records'
+  const cond = `${alias}.config_id = ${id}`
+
+  // 检查是否已有config_id条件
+  const hasConfigId = new RegExp(`(?:${alias}\\.)?config_id\\s*=\\s*${id}`, 'i').test(s)
+  if (hasConfigId) {
+    // 已有正确的config_id条件，直接返回
+    return s
+  }
+
+  const whereRegex = /\bwhere\b([\s\S]*?)(\border\s+by\b|\bgroup\s+by\b|\blimit\b|$)/i
+  const hasWhere = whereRegex.test(s)
+
+  if (hasWhere) {
+    // 移除旧的config_id相关条件（IS NULL等），然后添加新的
+    s = s.replace(new RegExp(`(?:${alias}\\.)?config_id\\s*(=|is\\s+null|is\\s+not\\s+null)[^\n]*`, 'ig'), '')
+    // 清理多余的AND/OR
+    s = s.replace(/\bwhere\s+(and|or)\s+/gi, 'WHERE ')
+    s = s.replace(/\s+(and|or)\s+$/gi, '')
+    // 添加新的config_id条件
+    s = s.replace(whereRegex, (_m, p1, p2) => {
+      const whereContent = p1.trim()
+      if (whereContent) {
+        return `WHERE ${whereContent} AND ${cond} ${p2 || ''}`
+      } else {
+        return `WHERE ${cond} ${p2 || ''}`
+      }
+    })
+  } else {
+    // 插入 WHERE 条件：在 FROM cargo_records 之后、ORDER/GROUP/LIMIT 之前
+    // 查找 FROM cargo_records 的位置
+    const fromMatch2 = s.match(/from\s+cargo_records(?:\s+(?:as\s+)?[a-zA-Z_][\w]*)?(\s+)/i)
+    if (fromMatch2) {
+      // 在 FROM cargo_records 之后插入 WHERE
+      const fromIndex = fromMatch2.index! + fromMatch2[0].length
+      const afterFrom = s.substring(fromIndex)
+      // 检查后面是否有 ORDER BY/GROUP BY/LIMIT
+      const splitMatch = afterFrom.match(/^\s*(\border\s+by\b|\bgroup\s+by\b|\bwhere\b|\blimit\b)/i)
+      if (splitMatch) {
+        // 如果有这些关键字，在它们之前插入 WHERE
+        const splitIndex = splitMatch.index!
+        const beforeSplit = afterFrom.substring(0, splitIndex)
+        const afterSplit = afterFrom.substring(splitIndex)
+        s = s.substring(0, fromIndex) + beforeSplit + ` WHERE ${cond} ` + afterSplit.trimStart()
+      } else {
+        // 没有这些关键字，直接在 FROM 之后插入 WHERE
+        s = s.substring(0, fromIndex) + ` WHERE ${cond}` + afterFrom
+      }
+    } else {
+      // 如果找不到 FROM cargo_records，在末尾添加 WHERE
+      s = `${s} WHERE ${cond}`
+    }
+  }
+  return s
+}
+
+function buildOptionFromSqlRows(type: string, rows: any[]) {
+  const base: any = {
+    tooltip: { trigger: 'axis', backgroundColor: 'rgba(0,0,0,0.8)', textStyle: { color: '#fff' } },
+    grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
+    textStyle: { color: '#fff' }
+  }
+  if (!rows || rows.length === 0) return generateWidgetOption(type)
+  const cols = Object.keys(rows[0])
+  if (cols.length < 2) return generateWidgetOption(type)
+  const xCol = cols[0]
+  const yCol = cols[1]
+
+  if (type === 'pie') {
+    return {
+      ...base,
+      series: [{ type: 'pie', radius: '60%', data: rows.map(r => ({ name: String(r[xCol]), value: Number(r[yCol]) || 0 })), label: { color: '#fff' } }]
+    }
+  }
+
+  return {
+    ...base,
+    xAxis: { type: 'category', data: rows.map(r => String(r[xCol])), axisLabel: { color: '#fff', rotate: type === 'bar' ? -45 : 0 }, axisLine: { lineStyle: { color: '#fff' } } },
+    yAxis: { type: 'value', axisLabel: { color: '#fff' }, axisLine: { lineStyle: { color: '#fff' } } },
+    series: [{ type: type === 'line' ? 'line' : 'bar', data: rows.map(r => Number(r[yCol]) || 0), smooth: type === 'line', itemStyle: { color: type === 'bar' ? '#67c23a' : undefined }, lineStyle: { color: '#409eff' }, areaStyle: type === 'line' ? { color: 'rgba(64, 158, 255, 0.2)' } : undefined }]
   }
 }
